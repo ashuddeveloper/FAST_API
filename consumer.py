@@ -1,57 +1,44 @@
+import asyncio
 import json
 import os
 
-import pika
-import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from fastapi_sqlalchemy import DBSessionMiddleware, db
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from models import Author as ModelAuthor
 from models import Book as ModelBook
+from rabbitmq.consumer import consume
+from rabbitmq.producer import publish
 
 load_dotenv(".env")
+engine = create_engine(os.environ['DATABASE_URL'])
 
-capp = FastAPI()
-
-capp.add_middleware(DBSessionMiddleware, db_url=os.environ["DATABASE_URL"])
-
-connection = pika.BlockingConnection(pika.URLParameters(os.environ["RABBITMQ_URL"]))
-channel = connection.channel()
-
-channel.exchange_declare(exchange = 'logs', exchange_type = 'fanout')
-
-result = channel.queue_declare(queue='', exclusive=True)
-queue_name = result.method.queue
-
-channel.queue_bind(exchange = 'logs', queue=queue_name)
-
-print(' [*] Waiting for logs to print CTRL+C')
-
-def add_author(author):
+def add_author(author, taskId):
     db_author = ModelAuthor(name=author["name"], age=author["age"])
-    with db() as d:
-        d.session.add(db_author)
-        d.session.commit()
-    return db_author
+    with Session(bind=engine) as d:
+        d.add(db_author)
+        d.commit()
+        id = {"recordId":db_author.id}
+    publish("taskId",id)
 
-def add_book(book):
-    db_book = ModelBook(title=book.title, rating=book.rating, author_id=book.author_id)
-    with db() as d:
-        d.session.add(db_book)
-        d.session.commit()
-    return db_book
+def add_book(book, taskId):
+    db_book = ModelBook(title=book["title"], rating=book["rating"], author_id=book["author_id"])
+    with Session(bind=engine) as d:
+        d.add(db_book)
+        d.commit()
+        id = {"recordId":db_book.id}
+    publish("taskId",id)
 
 def callback(ch, method, properties, body):
     body = json.loads(body)
-    if "name" in body:
-        add_author(body)
+    if "author" in body:
+        add_author(body["author"], body["taskId"])
     elif "book" in body:
         add_book(body)
 
-channel.basic_consume(queue=queue_name, on_message_callback = callback, auto_ack=True)
-
-channel.start_consuming()
+async def consumer():
+    await consume("logs",callback)
 
 if __name__ == "__main__":
-    uvicorn.run(capp, host="0.0.0.0", port=4000)
+    asyncio.run(consumer())
